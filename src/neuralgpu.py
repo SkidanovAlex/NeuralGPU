@@ -8,21 +8,21 @@ class TransformInputAcrossMaps:
     def transform_input(ctx, data, batch_size, domain_size, width, input_size, num_maps, out_extra_shapes):
         """ Each input value (expected as one-hot) is embedded such that input_maps[0,i,:] = embedding(input[i])"""
         embedding_w = mx.sym.Variable("embedding_weight")
-        padding = mx.sym.Variable("padding")
 
         out_extra_shapes['embedding_weight'] = (domain_size, num_maps)
         out_extra_shapes["input"] = (batch_size, input_size)
-        #out_extra_shapes["padding"] = (batch_size, width - 1, input_size, num_maps)
 
         # ok, this is a hack, but I don't know how to do an embedding if my input is three dimensional
         data = mx.symbol.Reshape(data=data, target_shape=(batch_size * input_size,), name='embedding_reshape1')
         data = mx.symbol.Embedding(data=data, weight=embedding_w, input_dim=domain_size, output_dim=num_maps, name='embedding')
 
-        padding = mx.sym.BlockGrad(data=padding, name="padding_block")
-
         data = mx.symbol.Reshape(data=data, target_shape=(batch_size, 1, input_size, num_maps), name='embedding_reshape2')
-        data = mx.symbol.Concat(data, data, data, data, num_args=4, dim=1, name='embedding_concat')
-        #data = mx.symbol.Concat(data, padding, num_args=2, dim=1, name='embedding_concat')
+        # concating with variable containing zeros doesn't work, see https://github.com/dmlc/mxnet/issues/1130
+        # hacking it by concating data to itself thrice, and multiplying by zero
+        assert width == 4
+        padding = mx.symbol.Concat(data, data, data, num_args=3, dim=1, name='embedding_concat_hack')
+        padding = padding * 0
+        data = mx.symbol.Concat(data, padding, num_args=2, dim=1, name='embedding_concat')
         data = mx.symbol.SwapAxis(data=data, dim1=1, dim2=3, name="embedding_swap")
         return data
         
@@ -65,13 +65,13 @@ class NeuralGPU:
         assert kernel_size[0] % 2 == 1 and kernel_size[1] % 2 == 1, "Kernel for the convolutional gated unit must have odd dimension sizes"
         pad_size = (kernel_size[0] // 2, kernel_size[1] // 2)
         for layer_n in range(num_layers):
-            u = mx.sym.Convolution(data=data, name=prefix + 'u_%d' % layer_n, weight=self._u_w[layer_n], bias=self._u_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
-            u = mx.sym.Activation(data=u, act_type='sigmoid')
-            r = mx.sym.Convolution(data=data, name=prefix + 'r_%d' % layer_n, weight=self._r_w[layer_n], bias=self._r_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
-            r = mx.sym.Activation(data=r, act_type='sigmoid')
+            u = mx.sym.Convolution(data=data, name='conv_' + prefix + 'u_%d' % layer_n, weight=self._u_w[layer_n], bias=self._u_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
+            u = mx.sym.Activation(data=u, act_type='sigmoid', name='act_' + prefix + 'u_%d' % layer_n)
+            r = mx.sym.Convolution(data=data, name='conv_' + prefix + 'r_%d' % layer_n, weight=self._r_w[layer_n], bias=self._r_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
+            r = mx.sym.Activation(data=r, act_type='sigmoid', name='act_' + prefix + 'r_%d' % layer_n)
 
-            t = mx.sym.Convolution(data=(r * data), name=prefix + 't_%d' % layer_n, weight=self._t_w[layer_n], bias=self._t_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
-            t = mx.sym.Activation(data=t, act_type='tanh')
+            t = mx.sym.Convolution(data=(r * data), name='conv_' + prefix + 't_%d' % layer_n, weight=self._t_w[layer_n], bias=self._t_b[layer_n], kernel=kernel_size, pad=pad_size, num_filter=num_maps)
+            t = mx.sym.Activation(data=t, act_type='tanh', name='act_' + prefix + 't_%d' % layer_n)
 
             data = u * data + (1 - u) * t
 
@@ -89,18 +89,7 @@ class NeuralGPU:
         return data
         
 
-    def __init__(self, ctx, domain_size, input_transformer, num_layers=2, kernel_size=(3, 3), num_maps=24):
-        self._shapes = {}
-        self._u_w, self._r_w, self._t_w, self._u_b, self._r_b, self._t_b = [[] for i in range(6)]
-        for layer_n in range(num_layers):
-            self._u_w.append(mx.sym.Variable("u_w_%d_weight" % layer_n))
-            self._r_w.append(mx.sym.Variable("r_w_%d_weight" % layer_n))
-            self._t_w.append(mx.sym.Variable("t_w_%d_weight" % layer_n))
-            self._u_b.append(mx.sym.Variable("u_b_%d_bias" % layer_n))
-            self._r_b.append(mx.sym.Variable("r_b_%d_bias" % layer_n))
-            self._t_b.append(mx.sym.Variable("t_b_%d_bias" % layer_n))
-
-        self._ctx = ctx
+    def __init__(self, domain_size, input_transformer, num_layers=2, kernel_size=(3, 3), num_maps=24):
         self._domain_size = domain_size
         self._kernel_size = kernel_size
         self._num_maps = num_maps
@@ -123,7 +112,19 @@ class NeuralGPU:
             b = X[:l - (X.shape[0] - fr)]
             return np.concatenate((a, b))
 
-    def train(self, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, X_val=None, y_val=None, optimizer="adam", max_grad_norm=5.0, verbose=True, **kwargs):
+    def train(self, ctx, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, X_val=None, y_val=None, optimizer="adam", max_grad_norm=5.0, verbose=True, **kwargs):
+        self._ctx = ctx
+
+        self._shapes = {}
+        self._u_w, self._r_w, self._t_w, self._u_b, self._r_b, self._t_b = [[] for i in range(6)]
+        for layer_n in range(self._num_layers):
+            self._u_w.append(mx.sym.Variable("u_w_%d_weight" % layer_n))
+            self._r_w.append(mx.sym.Variable("r_w_%d_weight" % layer_n))
+            self._t_w.append(mx.sym.Variable("t_w_%d_weight" % layer_n))
+            self._u_b.append(mx.sym.Variable("u_b_%d_bias" % layer_n))
+            self._r_b.append(mx.sym.Variable("r_b_%d_bias" % layer_n))
+            self._t_b.append(mx.sym.Variable("t_b_%d_bias" % layer_n))
+
         X = np.array(X)
         y = np.array(y)
 
@@ -152,7 +153,7 @@ class NeuralGPU:
         #print "ARG SHAPE", zip(arg_names, arg_shape)
         #print "OUT SHAPE", out_shape
         assert (initializer is None) == (self._stored_weights is not None)
-        arg_arrays = [mx.nd.zeros(s, ctx) for s in arg_shape] if initializer is not None else [self._stored_weights[n] if self.is_param_name(n) else mx.nd.zeros(s, ctx) for (n, s) in zip(arg_names, arg_shape)]
+        arg_arrays = [mx.nd.zeros(s, ctx) for s in arg_shape] if initializer is not None else [mx.nd.array(self._stored_weights[n], ctx) if self.is_param_name(n) else mx.nd.zeros(s, ctx) for (n, s) in zip(arg_names, arg_shape)]
 
         for shape, name in zip(arg_shape, arg_names):
             if self.is_param_name(name):
@@ -183,6 +184,7 @@ class NeuralGPU:
 
         beginning = 0
         num_samples = len(X)
+        accum_val_acc = 0
         for epoch_n in range(num_epochs):
             if verbose:
                 print "Epoch %3d ========" % epoch_n,
@@ -220,9 +222,15 @@ class NeuralGPU:
                 a = np.sum(out_np == y_val)
                 b = y_val.shape[0] * y_val.shape[1]
                 print a, b, 1.0 * a / b
+                accum_val_acc += 1.0 * a / b
 
 
-        self._stored_weights = arg_dict
+        self._stored_weights = {}
+        for k, v in arg_dict.items():
+            v.wait_to_read()
+            self._stored_weights[k] = v.asnumpy()
+
+        return accum_val_acc / num_epochs
 
 
 import random
@@ -234,40 +242,49 @@ if __name__ == "__main__":
             else: out.append(bit)
             a //= 2
 
-    ctx = mx.gpu(0)
-    ng = NeuralGPU(ctx, 3, TransformInputAcrossMaps)
+    ng = NeuralGPU(3, TransformInputAcrossMaps)
 
     debugging_small_set = False
 
     num_epochs = 3 if not debugging_small_set else 1
 
+    curric_len = 4
     first = True
-    for global_len in range(5, 21):
-        for cur_len in [global_len, global_len, global_len, 10, global_len, global_len, global_len, 20, global_len, global_len, global_len + 1, global_len, 20]:
-            print "CUR LEN ", cur_len
-            X = []
-            y = []
-            X_val = []
-            y_val = []
-            total_samples = 5000 if not debugging_small_set else 400
-            test_samples = 200
-            for i in range(total_samples):
-                a = random.randint(1, 1 << cur_len)
-                b = random.randint(1, 1 << cur_len)
-                c = a * b
-                inp = []
-                out = []
-                to_bin(a, inp, cur_len)
-                inp.append(2)
-                to_bin(b, inp, cur_len)
-                to_bin(c, out, cur_len + cur_len + 1)
-                if i < total_samples - test_samples:
-                    X.append(inp)
-                    y.append(out)
-                else:
-                    X_val.append(inp)
-                    y_val.append(out)
 
-            ng.train(cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 128, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, X_val=X_val, y_val=y_val)
-            first = False
+    while True:
+        cur_len = curric_len
+
+        if random.randint(1, 5) == 1:
+            cur_len = 20
+
+        print "CUR LEN ", cur_len
+        X = []
+        y = []
+        X_val = []
+        y_val = []
+        total_samples = 5000 if not debugging_small_set else 400
+        test_samples = 200
+        for i in range(total_samples):
+            a = random.randint(1, 1 << cur_len)
+            b = random.randint(1, 1 << cur_len)
+            c = a * b
+            inp = []
+            out = []
+            to_bin(a, inp, cur_len)
+            inp.append(2)
+            to_bin(b, inp, cur_len)
+            to_bin(c, out, cur_len + cur_len + 1)
+            if i < total_samples - test_samples:
+                X.append(inp)
+                y.append(out)
+            else:
+                X_val.append(inp)
+                y_val.append(out)
+
+        ctx = mx.gpu(0)
+        val = ng.train(ctx, cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 128, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, X_val=X_val, y_val=y_val)
+        first = False
+
+        if val > 0.9:
+            curric_len += 1
 
