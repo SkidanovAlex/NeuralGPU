@@ -1,10 +1,10 @@
 import mxnet as mx
 import numpy as np
-import math
+import math, sys
 
 class AbsValueLayer(mx.operator.NumpyOp):
     def __init__(self):
-        super(AbsValueLayer, self).__init__(False)
+        super(AbsValueLayer, self).__init__(True)
 
     def list_arguments(self):
         return ['data']
@@ -25,7 +25,7 @@ class AbsValueLayer(mx.operator.NumpyOp):
     def backward(self, out_grad, in_data, out_data, in_grad):
         x = in_data[0]
         dx = in_grad[0]
-        dx[:] = np.sign(x)
+        dx[:] = out_grad * np.sign(x)
 
 
 class TransformInputAcrossMaps:
@@ -102,6 +102,7 @@ class NeuralGPU:
             t = mx.sym.Activation(data=t, act_type='tanh', name='act_' + prefix + 't_%d' % layer_n)
 
             data = u * data + (1 - u) * t
+            data = mx.sym.Dropout(data=data, p=0.07)
 
         return data
 
@@ -163,6 +164,7 @@ class NeuralGPU:
         self._input_transformer = input_transformer
 
         self._stored_weights = None
+        self._updater = None
 
 
     def is_param_name(self, name):
@@ -178,7 +180,30 @@ class NeuralGPU:
             b = X[:l - (X.shape[0] - fr)]
             return np.concatenate((a, b))
 
-    def train(self, ctx, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, relaxation_pull, X_val=None, y_val=None, optimizer="adam", max_grad_norm=5.0, r=4, verbose=True, **kwargs):
+
+    def _average_relaxed_parameter_single(self, param, param_suffix, layer_no):
+        result = self._stored_weights["%s_%s_%s_%s" % (param, layer_no, 0, param_suffix)]
+        for par in range(1, self._r):
+            result = self._stored_weights["%s_%s_%s_%s" % (param, layer_no, par, param_suffix)]
+
+        result /= float(self._r)
+
+        self._stored_weights["%s_%s_%s_%s" % (param, layer_no, 0, param_suffix)] = result
+
+
+    def average_relaxed_parameters(self):
+        for layer_no in range(self._num_layers):
+            self._average_relaxed_parameter_single("u_w", "weight", layer_no)
+            self._average_relaxed_parameter_single("r_w", "weight", layer_no)
+            self._average_relaxed_parameter_single("t_w", "weight", layer_no)
+            self._average_relaxed_parameter_single("u_b", "bias", layer_no)
+            self._average_relaxed_parameter_single("r_b", "bias", layer_no)
+            self._average_relaxed_parameter_single("t_b", "bias", layer_no)
+
+        self._r = 1
+
+
+    def train(self, ctx, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, relaxation_pull, X_val=None, y_val=None, optimizer="adam", max_grad_norm=0.5, r=4, verbose=True, **kwargs):
         self._ctx = ctx
 
         self._shapes = {}
@@ -187,12 +212,12 @@ class NeuralGPU:
         # r is number of shared parameters, see "parameter sharing relaxation" section of the paper
         for par in range(r):
             for layer_n in range(self._num_layers):
-                self._u_w[par].append(mx.sym.Variable("u_w_%d_weight" % layer_n))
-                self._r_w[par].append(mx.sym.Variable("r_w_%d_weight" % layer_n))
-                self._t_w[par].append(mx.sym.Variable("t_w_%d_weight" % layer_n))
-                self._u_b[par].append(mx.sym.Variable("u_b_%d_bias" % layer_n))
-                self._r_b[par].append(mx.sym.Variable("r_b_%d_bias" % layer_n))
-                self._t_b[par].append(mx.sym.Variable("t_b_%d_bias" % layer_n))
+                self._u_w[par].append(mx.sym.Variable("u_w_%d_%d_weight" % (layer_n, par)))
+                self._r_w[par].append(mx.sym.Variable("r_w_%d_%d_weight" % (layer_n, par)))
+                self._t_w[par].append(mx.sym.Variable("t_w_%d_%d_weight" % (layer_n, par)))
+                self._u_b[par].append(mx.sym.Variable("u_b_%d_%d_bias" % (layer_n, par)))
+                self._r_b[par].append(mx.sym.Variable("r_b_%d_%d_bias" % (layer_n, par)))
+                self._t_b[par].append(mx.sym.Variable("t_b_%d_%d_bias" % (layer_n, par)))
 
         X = np.array(X)
         y = np.array(y)
@@ -207,8 +232,10 @@ class NeuralGPU:
 
         if optimizer == 'adam' and 'epsilon' not in kwargs:
             kwargs['epsilon'] = 1e-5 # as per the paper
-        optimizer = mx.optimizer.create(optimizer, learning_rate=learning_rate, **kwargs)
-        updater = mx.optimizer.get_updater(optimizer)
+
+        if not self._updater:
+            optimizer = mx.optimizer.create(optimizer, learning_rate=learning_rate, **kwargs)
+            self._updater = mx.optimizer.get_updater(optimizer)
 
         inp = mx.sym.Variable('input')
         label = mx.sym.Variable('label')
@@ -282,7 +309,7 @@ class NeuralGPU:
                 for idx, weight, grad, name in param_blocks:
                     if norm > max_grad_norm:
                         grad *= (max_grad_norm / norm)
-                    updater(idx, grad, weight)
+                    self._updater(idx, grad, weight)
                     # reset gradient to zero
                     grad[:] = 0.0
 
@@ -312,15 +339,59 @@ class NeuralGPU:
 
         return accum_val_acc / num_epochs
 
-
-import random
-if __name__ == "__main__":
+def gen_samples(task, cur_len):
     def to_bin(a, out, l, onehot=False):
         for i in range(l):
             bit = a % 2
             if onehot: out.append([bit, 1 - bit, 0])
             else: out.append(bit)
             a //= 2
+
+    X = []
+    y = []
+    X_val = []
+    y_val = []
+    total_samples = 512
+    test_samples = 200
+
+    for i in range(total_samples):
+        inp = []
+        out = []
+        if task == 'mul' or task == 'add':
+            a = random.randint(1, 1 << cur_len)
+            b = random.randint(1, 1 << cur_len)
+            c = a * b if task == 'mul' else a + b
+            to_bin(a, inp, cur_len)
+            inp.append(2)
+            to_bin(b, inp, cur_len)
+            to_bin(c, out, cur_len + cur_len + 1)
+
+        elif task in ['copy', 'reverse', 'invert']:
+            a = random.randint(1, 1 << (cur_len * 2 + 1))
+            to_bin(a, inp, cur_len * 2 + 1)
+            to_bin(a, out, cur_len * 2 + 1)
+            if task == 'reverse':
+                out = list(reversed(out))
+            elif task == 'invert':
+                out = [1 - x for x in out]
+
+        else: assert False, "Unknown task type %s" % task
+
+        if i < total_samples - test_samples:
+            X.append(inp)
+            y.append(out)
+        else:
+            X_val.append(inp)
+            y_val.append(out)
+
+    return X, y, X_val, y_val
+
+
+import random
+if __name__ == "__main__":
+    task = 'mul'
+    if len(sys.argv) > 1:
+        task = sys.argv[1]
 
     ng = NeuralGPU(3, TransformInputAcrossMaps)
 
@@ -329,44 +400,35 @@ if __name__ == "__main__":
     num_epochs = 3 if not debugging_small_set else 1
 
     relaxation_pull = 0.0005
-    curric_len = 4
+    curric_len = 2
     first = True
 
     while True:
         cur_len = curric_len
 
         if random.randint(1, 5) == 1:
-            cur_len = 10
+            cur_len = random.randint(2, 20)
+        elif random.randint(1, 4) == 1:
+            cur_len = random.randint(2, curric_len)
 
         print "CUR LEN ", cur_len
-        X = []
-        y = []
-        X_val = []
-        y_val = []
-        total_samples = 5000 if not debugging_small_set else 400
-        test_samples = 200
-        for i in range(total_samples):
-            a = random.randint(1, 1 << cur_len)
-            b = random.randint(1, 1 << cur_len)
-            c = a * b
-            inp = []
-            out = []
-            to_bin(a, inp, cur_len)
-            inp.append(2)
-            to_bin(b, inp, cur_len)
-            to_bin(c, out, cur_len + cur_len + 1)
-            if i < total_samples - test_samples:
-                X.append(inp)
-                y.append(out)
-            else:
-                X_val.append(inp)
-                y_val.append(out)
-
+        X, y, X_val, y_val = gen_samples(task, cur_len)
         ctx = mx.gpu(0)
-        val = ng.train(ctx, cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 128, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, relaxation_pull, X_val=X_val, y_val=y_val)
+        val = ng.train(ctx, cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 64, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, relaxation_pull, X_val=X_val, y_val=y_val)
         first = False
 
-        if val > 0.9:
+        if val > 0.9 and cur_len == curric_len and curric_len < 20:
             relaxation_pull *= 1.2
             curric_len += 1
+
+            if curric_len == 20:
+                ng.average_relaxed_parameters()
+
+        if val > 0.99 and cur_len == curric_len and curric_len >= 20:
+            # TODO: average all the relaxed parameters when enter here for the first time
+            relaxation_pull *= 1.2
+            curric_len += 5
+
+        if curric_len == 200:
+            break
 
