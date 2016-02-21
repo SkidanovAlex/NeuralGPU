@@ -306,7 +306,7 @@ class NeuralGPU:
                 # updare parameters
                 norm = 0.
                 for idx, weight, grad, name in param_blocks:
-                    grad /= (batch_size * input_size)
+                    grad /= (batch_size * (input_size + r // 2-1) / (r // 2))
                     l2_norm = mx.nd.norm(grad).asscalar()
                     norm += l2_norm*l2_norm
                 norm = math.sqrt(norm)
@@ -408,7 +408,8 @@ if __name__ == "__main__":
     ng = NeuralGPU(3, TransformInputAcrossMaps)
 
     relaxation_pull = 0.0005
-    curric_len = 2
+    curric_len = 3
+    largest_len = 3
     first = True
     iter_ord = 0
     bad_iters = 0
@@ -418,14 +419,19 @@ if __name__ == "__main__":
     while True:
         iter_ord += 1
         cur_len = curric_len
+        if curric_len > largest_len:
+            largest_len = curric_len
 
         if curric_len >= 3:
             if iter_ord % 6 == 5:
                 cur_len = random.randint(3, 20)
-            elif iter_ord % 2 == 1:
+            elif iter_ord % 6 == 1:
+                cur_len = random.randint(3, curric_len)
+                cur_len = max(cur_len, random.randint(3, curric_len))
+            elif iter_ord % 6 == 3:
                 cur_len = random.randint(3, curric_len)
 
-        print "CUR LEN ", cur_len, " ... ",
+        print "CUR LEN %3d (%3d)" % (cur_len, largest_len), " ... ",
         num_epochs = 2 if cur_len == curric_len else 1
         sys.stdout.flush()
         X, y, X_val, y_val = gen_samples(task, cur_len)
@@ -435,11 +441,12 @@ if __name__ == "__main__":
         except Exception as e:
             # sometimes memory errors happen, but seem to recover by the next iteration
             print e
+            raise
 
         history.append(ng._stored_weights)
-        if len(history) > 20:
+        if len(history) > 40:
             history = history[1:]
-            assert len(history) == 20
+            assert len(history) == 40
 
         first = False
 
@@ -453,11 +460,14 @@ if __name__ == "__main__":
         elif cur_len == curric_len:
             bad_iters = 0
 
-        if bad_iters >= 10:
-            print "ROLLING THE MODEL 20 ITERATIONS BACK"
+        if bad_iters >= 20 and curric_len > 3:
+            print "ROLLING THE MODEL 40 ITERATIONS BACK"
             bad_iters = 0
             ng._stored_weights = history[0]
             history = history[0:1]
+            # sometimes it helps to reduce current length
+            if curric_len > 6 and random.randint(1, 3) == 1:
+                curric_len -= 1
 
         if curric_len == 200:
             break
