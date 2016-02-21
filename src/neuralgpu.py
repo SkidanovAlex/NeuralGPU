@@ -113,9 +113,11 @@ class NeuralGPU:
             s += weight
 
         s /= float(len(weights))
-        ret = AbsValueLayer()(weights[0] - s)
+        #ret = AbsValueLayer()(weights[0] - s)
+        ret = (weights[0] - s) * (weights[0] - s)
         for weight in weights[1:]:
-            ret += AbsValueLayer()(data=weight - s)
+            #ret += AbsValueLayer()(data=weight - s)
+            ret += (weight - s) * (weight - s)
 
         return ret
 
@@ -140,8 +142,8 @@ class NeuralGPU:
         ret_w *= relaxation_pull
         ret_b *= relaxation_pull
         # using AbsValueLayer here as a Identity to add name (values are always positive at this moment)
-        ret_w = AbsValueLayer()(data=ret_w, name='relax0')
-        ret_b = AbsValueLayer()(data=ret_b, name='relax1')
+        #ret_w = AbsValueLayer()(data=ret_w, name='relax0')
+        #ret_b = AbsValueLayer()(data=ret_b, name='relax1')
         return (ret_w, ret_b)
 
 
@@ -203,7 +205,8 @@ class NeuralGPU:
         self._r = 1
 
 
-    def train(self, ctx, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, relaxation_pull, X_val=None, y_val=None, optimizer="adam", max_grad_norm=0.5, r=4, verbose=True, **kwargs):
+    # TODO: make r=6
+    def train(self, ctx, input_size, width, depth, X, y, batch_size, num_epochs, learning_rate, momentum, initializer, relaxation_pull, X_val=None, y_val=None, optimizer="adam", max_grad_norm=5, r=6, verbose=True, **kwargs):
         self._ctx = ctx
 
         self._shapes = {}
@@ -235,7 +238,10 @@ class NeuralGPU:
 
         if not self._updater:
             optimizer = mx.optimizer.create(optimizer, learning_rate=learning_rate, **kwargs)
+            self._optimizer = optimizer
             self._updater = mx.optimizer.get_updater(optimizer)
+
+        self._optimizer.wd = 0.1 * math.sqrt(input_size)
 
         inp = mx.sym.Variable('input')
         label = mx.sym.Variable('label')
@@ -272,7 +278,6 @@ class NeuralGPU:
                 assert name not in args_grad
 
         output = out_dict["output_output"]
-        w_pull_out = out_dict["relax0_output"]
 
         inp = arg_dict["input"]
         label = arg_dict["label"]
@@ -280,10 +285,9 @@ class NeuralGPU:
         beginning = 0
         num_samples = len(X)
         accum_val_acc = 0
-        total_w_pull = 0
         for epoch_n in range(num_epochs):
             if verbose:
-                print "Epoch %3d ========" % epoch_n,
+                print " | Epoch %3d ========" % epoch_n,
             for it in range((num_samples + batch_size - 1) // batch_size):
                 mx.nd.array(NeuralGPU.get_batch(X, beginning, batch_size)).copyto(inp)
                 mx.nd.array(NeuralGPU.get_batch(y, beginning, batch_size)).copyto(label)
@@ -302,10 +306,15 @@ class NeuralGPU:
                 # updare parameters
                 norm = 0.
                 for idx, weight, grad, name in param_blocks:
-                    grad /= batch_size
+                    grad /= (batch_size * input_size)
                     l2_norm = mx.nd.norm(grad).asscalar()
                     norm += l2_norm*l2_norm
                 norm = math.sqrt(norm)
+                if norm > max_grad_norm:
+                    if norm > max_grad_norm * 10:
+                        print "!",
+                    else:
+                        print ".",
                 for idx, weight, grad, name in param_blocks:
                     if norm > max_grad_norm:
                         grad *= (max_grad_norm / norm)
@@ -321,23 +330,26 @@ class NeuralGPU:
                 y_val = y_val[:batch_size]
                 model_exec.forward(is_train=False)
                 out_np = np.argmax(output.asnumpy(), axis=1)
-                w_pull = np.sum(w_pull_out.asnumpy())
 
                 a = np.sum(out_np == y_val)
                 b = y_val.shape[0] * y_val.shape[1]
-                print a, b, 1.0 * a / b
+                print "%5d/%5d = %.10lf" % (a, b, 1.0 * a / b),
+                sys.stdout.flush()
                 accum_val_acc += 1.0 * a / b
-
-                total_w_pull += w_pull
-
-        print "PULL ", total_w_pull
 
         self._stored_weights = {}
         for k, v in arg_dict.items():
             v.wait_to_read()
             self._stored_weights[k] = v.asnumpy()
 
+        print ""
+
         return accum_val_acc / num_epochs
+
+# returns the performance
+def reset_at(task):
+    if task == 'add': return 0.82
+    else: return 0.70
 
 def gen_samples(task, cur_len):
     def to_bin(a, out, l, onehot=False):
@@ -395,39 +407,57 @@ if __name__ == "__main__":
 
     ng = NeuralGPU(3, TransformInputAcrossMaps)
 
-    debugging_small_set = False
-
-    num_epochs = 3 if not debugging_small_set else 1
-
     relaxation_pull = 0.0005
     curric_len = 2
     first = True
+    iter_ord = 0
+    bad_iters = 0
+
+    history = []
 
     while True:
+        iter_ord += 1
         cur_len = curric_len
 
-        if random.randint(1, 5) == 1:
-            cur_len = random.randint(2, 20)
-        elif random.randint(1, 4) == 1:
-            cur_len = random.randint(2, curric_len)
+        if curric_len >= 3:
+            if iter_ord % 6 == 5:
+                cur_len = random.randint(3, 20)
+            elif iter_ord % 2 == 1:
+                cur_len = random.randint(3, curric_len)
 
-        print "CUR LEN ", cur_len
+        print "CUR LEN ", cur_len, " ... ",
+        num_epochs = 2 if cur_len == curric_len else 1
+        sys.stdout.flush()
         X, y, X_val, y_val = gen_samples(task, cur_len)
         ctx = mx.gpu(0)
-        val = ng.train(ctx, cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 64, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, relaxation_pull, X_val=X_val, y_val=y_val)
+        try:
+            val = ng.train(ctx, cur_len + cur_len + 1, 4, cur_len + cur_len, X, y, 64, num_epochs, 0.01, 0.9, mx.initializer.Uniform(0.3) if first else None, relaxation_pull, X_val=X_val, y_val=y_val)
+        except Exception as e:
+            # sometimes memory errors happen, but seem to recover by the next iteration
+            print e
+
+        history.append(ng._stored_weights)
+        if len(history) > 20:
+            history = history[1:]
+            assert len(history) == 20
+
         first = False
 
-        if val > 0.9 and cur_len == curric_len and curric_len < 20:
+        if val >= 0.998 and cur_len == curric_len:
             relaxation_pull *= 1.2
-            curric_len += 1
+            curric_len += (cur_len + 19) // 20 # +1 for the first 20 iters, then more and more
+            iter_ord = 0
 
-            if curric_len == 20:
-                ng.average_relaxed_parameters()
+        if val < reset_at(task) and cur_len == curric_len:
+            bad_iters += 1
+        elif cur_len == curric_len:
+            bad_iters = 0
 
-        if val > 0.99 and cur_len == curric_len and curric_len >= 20:
-            # TODO: average all the relaxed parameters when enter here for the first time
-            relaxation_pull *= 1.2
-            curric_len += 5
+        if bad_iters >= 10:
+            print "ROLLING THE MODEL 20 ITERATIONS BACK"
+            bad_iters = 0
+            ng._stored_weights = history[0]
+            history = history[0:1]
 
         if curric_len == 200:
             break
